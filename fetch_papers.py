@@ -1,5 +1,6 @@
 """
 Fetch viral AI papers from arXiv and Hugging Face with impact scoring
+Rotates through top-tier conferences daily for diverse high-quality sources
 """
 import os
 import requests
@@ -7,6 +8,29 @@ import arxiv
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import time
+
+# Top-tier conferences and venues for AI/ML research
+TOP_TIER_VENUES = {
+    'neurips': {'name': 'NeurIPS', 'bonus': 50, 'focus': 'ML foundations, RL, agents'},
+    'icml': {'name': 'ICML', 'bonus': 50, 'focus': 'Core ML theory'},
+    'iclr': {'name': 'ICLR', 'bonus': 50, 'focus': 'Deep learning'},
+    'aamas': {'name': 'AAMAS', 'bonus': 60, 'focus': 'Autonomous agents (most relevant!)'},
+    'aaai': {'name': 'AAAI', 'bonus': 45, 'focus': 'Broad AI'},
+    'ijcai': {'name': 'IJCAI', 'bonus': 45, 'focus': 'Broad AI'},
+    'cvpr': {'name': 'CVPR', 'bonus': 40, 'focus': 'Computer vision'},
+    'acl': {'name': 'ACL', 'bonus': 40, 'focus': 'NLP/Language agents'},
+    'emnlp': {'name': 'EMNLP', 'bonus': 40, 'focus': 'NLP'},
+    'corl': {'name': 'CoRL', 'bonus': 45, 'focus': 'Robot learning'},
+}
+
+# arXiv categories for different focuses
+ARXIV_CATEGORIES = [
+    'cs.AI',  # Artificial Intelligence
+    'cs.MA',  # Multiagent Systems (key for agentic AI!)
+    'cs.LG',  # Machine Learning
+    'cs.RO',  # Robotics
+    'cs.CL',  # Computation and Language
+]
 
 
 def fetch_huggingface_papers(num_papers: int = 5) -> List[Dict]:
@@ -38,26 +62,54 @@ def fetch_huggingface_papers(num_papers: int = 5) -> List[Dict]:
         return []
 
 
-def fetch_arxiv_papers(topic: str = "", num_papers: int = 5) -> List[Dict]:
-    """Fetch recent papers from arXiv based on topic"""
+def get_daily_arxiv_category() -> str:
+    """Get arXiv category for today (rotates daily)"""
+    day_of_year = datetime.now().timetuple().tm_yday
+    category_index = day_of_year % len(ARXIV_CATEGORIES)
+    return ARXIV_CATEGORIES[category_index]
+
+
+def detect_paper_venue(paper: Dict) -> Optional[str]:
+    """Detect if paper is from a top-tier conference based on title/abstract"""
+    searchable_text = (
+        paper.get('title', '').lower() + ' ' +
+        paper.get('abstract', '').lower()
+    )
+
+    # Check for conference mentions in paper metadata
+    for venue_key, venue_info in TOP_TIER_VENUES.items():
+        venue_name = venue_info['name'].lower()
+        if venue_name in searchable_text:
+            return venue_key
+
+    return None
+
+
+def fetch_arxiv_papers(topic: str = "", num_papers: int = 5, category: str = None) -> List[Dict]:
+    """Fetch recent papers from arXiv based on topic and category"""
     try:
+        # Use provided category or get daily rotation
+        arxiv_category = category if category else get_daily_arxiv_category()
+
         # Build search query
         if topic:
-            search_query = f'all:"{topic}" AND cat:cs.AI'
+            search_query = f'all:"{topic}" AND cat:{arxiv_category}'
         else:
-            search_query = 'cat:cs.AI OR cat:cs.LG OR cat:cs.CL'
+            search_query = f'cat:{arxiv_category}'
+
+        print(f"  Searching arXiv category: {arxiv_category}")
 
         # Search arXiv
         search = arxiv.Search(
             query=search_query,
-            max_results=num_papers,
+            max_results=num_papers * 2,  # Fetch more for better filtering
             sort_by=arxiv.SortCriterion.SubmittedDate,
             sort_order=arxiv.SortOrder.Descending
         )
 
         papers = []
         for result in search.results():
-            papers.append({
+            paper = {
                 'title': result.title,
                 'authors': ', '.join([author.name for author in result.authors]),
                 'abstract': result.summary,
@@ -65,10 +117,19 @@ def fetch_arxiv_papers(topic: str = "", num_papers: int = 5) -> List[Dict]:
                 'pdf_url': result.pdf_url,
                 'published_date': result.published.isoformat(),
                 'upvotes': 0,
-                'source': 'arXiv'
-            })
+                'source': f'arXiv ({arxiv_category})',
+                'arxiv_category': arxiv_category
+            }
 
-        return papers
+            # Detect if from top-tier venue
+            venue = detect_paper_venue(paper)
+            if venue:
+                paper['venue'] = venue
+                paper['source'] = f"{TOP_TIER_VENUES[venue]['name']} (arXiv)"
+
+            papers.append(paper)
+
+        return papers[:num_papers]
     except Exception as e:
         print(f"Error fetching from arXiv: {e}")
         return []
@@ -131,6 +192,7 @@ def calculate_impact_score(paper: Dict, topic: str = None) -> float:
     - Influential citations: 10 points each
     - Recency bonus: +20 points if published in last 30 days
     - Topic relevance: +30 points if keywords in title
+    - Venue bonus: +40-60 points for top-tier conferences
     """
     score = 0.0
 
@@ -159,6 +221,13 @@ def calculate_impact_score(paper: Dict, topic: str = None) -> float:
         if any(keyword in title for keyword in keywords):
             score += 30
 
+    # Venue bonus (top-tier conferences get priority)
+    venue = paper.get('venue')
+    if venue and venue in TOP_TIER_VENUES:
+        venue_bonus = TOP_TIER_VENUES[venue]['bonus']
+        score += venue_bonus
+        paper['venue_bonus'] = venue_bonus  # Track for display
+
     return score
 
 
@@ -166,34 +235,46 @@ def fetch_high_impact_papers(topic: str = None, num_papers: int = 5) -> List[Dic
     """
     Fetch high-impact papers using hybrid approach:
     1. Get Hugging Face trending papers (community validated)
-    2. Filter by topic if specified
-    3. Enrich with Semantic Scholar citation data
-    4. Sort by impact score
+    2. Add arXiv papers from daily-rotating category
+    3. Filter by topic if specified
+    4. Enrich with Semantic Scholar citation data
+    5. Detect top-tier venues and add bonus
+    6. Sort by impact score
     """
-    print("Fetching papers with impact scoring...")
+    # Show daily rotation info
+    daily_category = get_daily_arxiv_category()
+    print("=" * 80)
+    print(f"📚 Daily Source Rotation:")
+    print(f"  Today's arXiv category: {daily_category}")
+    print(f"  Bonus for top-tier venues: NeurIPS, ICML, ICLR, AAMAS, etc.")
+    print("=" * 80)
+
+    print("\nFetching papers with impact scoring...")
 
     # Get more papers than needed for better filtering
     fetch_count = num_papers * 3 if topic else num_papers
 
     # Fetch from Hugging Face (already curated for quality)
-    print("Fetching trending papers from Hugging Face...")
+    print("1. Fetching trending papers from Hugging Face...")
     hf_papers = fetch_huggingface_papers(fetch_count)
+
+    # Always add arXiv papers from daily rotation
+    print(f"2. Fetching from arXiv (rotating category)...")
+    arxiv_papers = fetch_arxiv_papers(topic if topic else "", num_papers * 2, daily_category)
+
+    # Combine sources
+    all_papers = hf_papers + arxiv_papers
 
     # Filter by topic if specified
     if topic:
-        print(f"Filtering papers by topic: {topic}")
-        filtered_papers = filter_papers_by_topic(hf_papers, topic)
-
-        # If not enough papers after filtering, add from arXiv
-        if len(filtered_papers) < num_papers:
-            print(f"Found {len(filtered_papers)} matching papers, searching arXiv...")
-            arxiv_papers = fetch_arxiv_papers(topic, num_papers * 2)
-            filtered_papers.extend(arxiv_papers)
+        print(f"3. Filtering papers by topic: '{topic}'")
+        filtered_papers = filter_papers_by_topic(all_papers, topic)
+        print(f"   Found {len(filtered_papers)} papers matching topic")
     else:
-        filtered_papers = hf_papers
+        filtered_papers = all_papers
 
     # Enrich with citation data from Semantic Scholar
-    print("Enriching with citation data...")
+    print("4. Enriching with citation data...")
     for paper in filtered_papers[:20]:  # Limit API calls
         arxiv_id = paper.get('arxiv_id', '')
         if arxiv_id:
@@ -202,7 +283,20 @@ def fetch_high_impact_papers(topic: str = None, num_papers: int = 5) -> List[Dic
             paper['influential_citations'] = scholar_data['influential_citations']
             time.sleep(0.1)  # Rate limiting
 
+    # Detect venues for all papers
+    print("5. Detecting top-tier conference venues...")
+    venue_count = 0
+    for paper in filtered_papers:
+        if not paper.get('venue'):  # Only if not already detected
+            venue = detect_paper_venue(paper)
+            if venue:
+                paper['venue'] = venue
+                venue_count += 1
+    if venue_count > 0:
+        print(f"   Found {venue_count} papers from top-tier venues!")
+
     # Calculate impact scores
+    print("6. Calculating impact scores...")
     for paper in filtered_papers:
         paper['impact_score'] = calculate_impact_score(paper, topic)
 
@@ -216,9 +310,11 @@ def fetch_high_impact_papers(topic: str = None, num_papers: int = 5) -> List[Dic
     # Return top N papers
     result = sorted_papers[:num_papers]
 
-    print(f"Selected {len(result)} high-impact papers")
+    print(f"\n✅ Selected {len(result)} highest-impact papers:")
     for i, paper in enumerate(result, 1):
-        print(f"  {i}. {paper['title'][:60]}... (score: {paper['impact_score']:.0f}, citations: {paper.get('citations', 0)})")
+        venue_tag = f" [{TOP_TIER_VENUES[paper['venue']]['name']}]" if paper.get('venue') else ""
+        print(f"  {i}. {paper['title'][:55]}...{venue_tag}")
+        print(f"     Score: {paper['impact_score']:.0f} | Citations: {paper.get('citations', 0)} | Source: {paper.get('source', 'Unknown')}")
 
     return result
 
